@@ -2,7 +2,7 @@
 CFLAGS=-std=c++14
 
 marchingsquares: marchingsquares.cpp
-	g++ $(CFLAGS) -g -O0 -DEXECUTABLE marchingsquares.cpp -o marchingsquares
+	g++ $(CFLAGS) -g -O0 -DEXECUTABLE marchingsquares.cpp -o marchingsquares.exe
 
 marchingsquares.o: marchingsquares.cpp
 	em++ $(CFLAGS) -O2 -DWASM -c marchingsquares.cpp -o marchingsquares.o
