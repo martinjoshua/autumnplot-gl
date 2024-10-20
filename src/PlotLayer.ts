@@ -80,7 +80,7 @@ class PlotLayer<MapType extends MapLikeType> extends PlotLayerBase<MapType> {
  * height_layer.setActiveKey('20230112_1200');
  */
 class MultiPlotLayer<MapType extends MapLikeType> extends PlotLayerBase<MapType> {
-    private fields: Record<string, PlotComponent<MapType>>;
+    private fields: Record<string, PlotComponent<MapType>[]>;
     private field_key: string | null;
 
     private gl: WebGLAnyRenderingContext | null;
@@ -106,8 +106,8 @@ class MultiPlotLayer<MapType extends MapLikeType> extends PlotLayerBase<MapType>
         this.map = map;
         this.gl = gl;
 
-        Object.values(this.fields).forEach(field => {
-            field.onAdd(map, gl).then(res => {
+        Object.values(this.fields).forEach(fields => {
+            Promise.all(fields.map(a => a.onAdd(map, gl))).then(res => {
                 this.repaint();
             });
         });
@@ -122,7 +122,7 @@ class MultiPlotLayer<MapType extends MapLikeType> extends PlotLayerBase<MapType>
     public render(gl: WebGLAnyRenderingContext, matrix: number[] | Float32Array) {
         if (this.map !== null && this.gl !== null && this.field_key !== null 
             && this.fields.hasOwnProperty(this.field_key) && this.fields[this.field_key] !== null) {
-            this.fields[this.field_key].render(gl, matrix);
+            this.fields[this.field_key].forEach(a => a.render(gl, matrix));
         }
     }
 
@@ -151,15 +151,19 @@ class MultiPlotLayer<MapType extends MapLikeType> extends PlotLayerBase<MapType>
      * @param key   - The key to associate with the field
      */
     public addField(field: PlotComponent<MapType>, key: string) {
+        this.addFields([field], key);
+    }
+
+    public addFields(fields: PlotComponent<MapType>[], key: string) {
         const old_field_key = this.field_key;
 
-        if (this.map !== null && this.gl !== null && field !== null) {
-            field.onAdd(this.map, this.gl).then(res => {
+        if (this.map !== null && this.gl !== null && fields !== null) {
+            Promise.all(fields.map(a => a.onAdd(this.map, this.gl))).then(res => {
                 this.repaint();
             });
         }
 
-        this.fields[key] = field;
+        this.fields[key] = fields;
         
         if (this.field_key === null) {
             this.field_key = key;
