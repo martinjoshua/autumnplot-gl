@@ -173,6 +173,8 @@ interface ContourLabelOptions {
      * @default false
      */
     halo?: boolean;
+
+    number_format?: Intl.NumberFormat;
 }
 
 const contour_label_opt_defaults: Required<ContourLabelOptions> = {
@@ -182,7 +184,8 @@ const contour_label_opt_defaults: Required<ContourLabelOptions> = {
     font_url_template: '',
     text_color: '#000000',
     halo_color: '#000000',
-    halo: false
+    halo: false,
+    number_format: null
 }
 
 class ContourLabels<ArrayType extends TypedArray, MapType extends MapLikeType> extends PlotComponent<MapType> {
@@ -226,8 +229,9 @@ class ContourLabels<ArrayType extends TypedArray, MapType extends MapLikeType> e
         let min_label_lat: number = null, max_label_lat: number = null, min_label_lon: number = null, max_label_lon: number = null;
 
         Object.entries(contour_data).forEach(([level, contours]) => {
-            const icntr = (parseFloat(level) - contour_levels[0]);
-            const level_str = level.toString();
+            const lvlF = parseFloat(level);
+            const icntr = (lvlF - contour_levels[0]);
+            const level_str = this.opts.number_format ? this.opts.number_format.format(lvlF) : level.toString();
 
             contours.forEach(contour => {
                 const c_map = contour.map(v => {
