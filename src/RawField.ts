@@ -1,11 +1,12 @@
 
 import { Float16Array } from "@petamoriken/float16";
 import { ContourData, TypedArray, TypedArrayStr, WebGLAnyRenderingContext, WindProfile, isStormRelativeWindProfile } from "./AutumnTypes";
-import { contourCreator, FieldContourOpts } from "./ContourCreator";
+import { FieldContourOpts } from "./ContourCreator";
 import { Grid } from "./Grid";
 import { Cache, getArrayConstructor, zip } from "./utils";
 import { WGLTextureSpec } from "autumn-wgl";
-import { getGLFormatTypeAlignment } from "./PlotComponent";
+import { getGLFormatTypeAlignment, layer_worker } from "./PlotComponent";
+import * as Comlink from 'comlink';
 
 type TextureDataType<ArrayType> = ArrayType extends Float32Array ? Float32Array : (ArrayType extends Uint8Array ? Uint8Array : Uint16Array);
 
@@ -40,7 +41,34 @@ class RawScalarField<ArrayType extends TypedArray, GridType extends Grid> {
         }
 
         this.contour_cache = new Cache(async (opts: FieldContourOpts) => {
-            return await contourCreator(this.data, this.grid, opts);
+            // Get grid coordinates and pre-transform them
+            const grid_coords = this.grid.getGridCoords();
+            const x_transformed = new Float32Array(grid_coords.x.length);
+            const y_transformed = new Float32Array(grid_coords.y.length);
+            
+            for (let i = 0; i < grid_coords.x.length; i++) {
+                const transformed = this.grid.transform(grid_coords.x[i], grid_coords.y[i], {inverse: true});
+                x_transformed[i] = transformed[0];
+                y_transformed[i] = transformed[1];
+            }
+            
+            const gridData = {
+                ni: this.grid.ni,
+                nj: this.grid.nj,
+                x: x_transformed,
+                y: y_transformed
+            };
+            
+            // Pass raw buffers and type info for reconstruction on worker side
+            const payload = {
+                dataBuffer: this.data.buffer,
+                dataType: getArrayDType(this.data),
+                grid: gridData,
+                opts: opts
+            };
+            
+            const transferables = [this.data.buffer, gridData.x.buffer, gridData.y.buffer];
+            return await layer_worker.getContours(Comlink.transfer(payload, transferables));
         });
     }
 

@@ -1,6 +1,8 @@
 
 import { getMinZoom } from "./utils";
-import { LineData, Polyline } from "./AutumnTypes";
+import { LineData, Polyline, TypedArray } from "./AutumnTypes";
+import { contourCreator, FieldContourOpts } from "./ContourCreator";
+import { Grid } from "./Grid";
 
 import * as Comlink from 'comlink';
 import { LngLat } from "./Map";
@@ -375,7 +377,31 @@ function makePolylines(lines: LineData[]) : Polyline {
 const ep_interface = {
     'makeBBElements': makeBBElements, 
     'makeDomainVerticesAndTexCoords': makeDomainVerticesAndTexCoords,
-    'makePolyLines': makePolylines
+    'makePolyLines': makePolylines,
+    'getContours': async (payload: any) => {
+        const {dataBuffer, dataType, grid: gridData, opts} = payload;
+        
+        // Reconstruct TypedArray from buffer and type info
+        let data: any;
+        if (dataType === 'float32') {
+            data = new Float32Array(dataBuffer);
+        } else if (dataType === 'uint8') {
+            data = new Uint8Array(dataBuffer);
+        } else {
+            // float16 - stored as Uint16Array
+            data = new Uint16Array(dataBuffer);
+        }
+        
+        // Create a minimal grid-like object with pre-transformed coordinates
+        const gridLike: any = {
+            ni: gridData.ni,
+            nj: gridData.nj,
+            getGridCoords: () => ({x: gridData.x, y: gridData.y}),
+            transform: (x: number, y: number, opt: any) => [x, y] // identity transform (already transformed)
+        };
+        
+        return await contourCreator(data, gridLike as Grid, opts as FieldContourOpts);
+    }
 }
 
 type PlotLayerWorker = typeof ep_interface;

@@ -17,7 +17,7 @@ import { LineStyle } from "./PolylineCollection";
 import { RawScalarField, RawVectorField, RawProfileField, VectorRelativeTo, RawVectorFieldOptions, RawObsField, ObsRawData} from "./RawField";
 import { Grid, GridType, StructuredGrid, PlateCarreeGrid, PlateCarreeRotatedGrid, LambertGrid, UnstructuredGrid } from './Grid'
 
-import { initMSModule, FieldContourOpts } from './ContourCreator';
+import { FieldContourOpts } from './ContourCreator';
 
 /** All built-in colormaps */
 const colormaps = {
@@ -38,13 +38,11 @@ interface InitAutumnPlotOpts {
 }
 
 /**
- * Initialize the WebAssembly module in autumnplot-gl. It's not strictly necessary to call it first, but if you call it
- * first, you can prevent races when you contour a bunch of fields at once.
+ * Initialize the WebAssembly module in autumnplot-gl. With the web worker approach,
+ * this is now a no-op but is kept for API compatibility.
  */
 function initAutumnPlot(opts?: InitAutumnPlotOpts) {
-    opts = opts === undefined ? {} : opts;
-
-    initMSModule({document_script: opts.wasm_base_url});
+    // Module initialization now happens in the web worker
 }
 
 export {PlotComponent,

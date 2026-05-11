@@ -158,7 +158,7 @@ class MultiPlotLayer<MapType extends MapLikeType> extends PlotLayerBase<MapType>
         const old_field_key = this.field_key;
 
         if (this.map !== null && this.gl !== null && fields !== null) {
-            Promise.all(fields.map(a => a.onAdd(this.map, this.gl))).then(res => {
+            Promise.all(fields.map(a => a.onAdd(this.map!, this.gl!))).then(res => {
                 this.repaint();
             });
         }

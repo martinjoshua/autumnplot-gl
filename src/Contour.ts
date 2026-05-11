@@ -251,7 +251,7 @@ interface ContourLabelOptions {
      */
     halo?: boolean;
 
-    number_format?: Intl.NumberFormat;
+    number_format?: Intl.NumberFormat | null;
 
     /**
      * Label density. 2 makes the labels twice as dense, 0.5 makes them half as dense.
