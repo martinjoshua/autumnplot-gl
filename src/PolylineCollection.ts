@@ -1,26 +1,63 @@
 
-import { Float16Array } from "@petamoriken/float16";
-import { WGLBuffer, WGLProgram, WGLTexture, WGLTextureSpec } from "autumn-wgl";
-import { Polyline, LineData, WebGLAnyRenderingContext } from "./AutumnTypes";
-import { ColorMap, makeIndexMap, makeTextureImage } from "./Colormap";
-import { getGLFormatTypeAlignment, layer_worker } from "./PlotComponent";
-import { Cache, hex2rgba } from "./utils";
+import { WGLBuffer, WGLTexture } from "autumn-wgl";
+import { Polyline, LineData, WebGLAnyRenderingContext, isWebGL2Ctx, RenderMethodArg, getRendererData } from "./AutumnTypes";
+import { ColorMap, ColorMapGPUInterface } from "./Colormap";
+import { Color } from "./Color";
+import { layer_worker } from "./PlotComponent";
+import { ShaderProgramManager } from "./ShaderManager";
 
 const polyline_vertex_src = require('./glsl/polyline_vertex.glsl');
 const polyline_fragment_src = require('./glsl/polyline_fragment.glsl');
 
+/**
+ * A style to use to draw lines. The possible options are '-' for a solid line, '--' for a dashed line, ':' for a
+ *  dotted line, '-.' for a dash-dot line, or you could pass a list of numbers (e.g., [1, 1, 1, 0, 1, 0]) to
+ *  specify a custom dash scheme.
+ */
+type LineStyle = "-" | "--" | ":" | "-." | number[];
+
+const dash_arrays: Record<Exclude<LineStyle, number[]>, number[]> = {
+    "-": [1],
+    "--": [1, 1, 1, 1, 0, 0],
+    ":": [1, 0],
+    "-.": [1, 1, 1, 0, 1, 0],
+}
+
+function isLineStyle(obj: any) : obj is LineStyle {
+    return obj in dash_arrays || Array.isArray(obj) && obj.length > 0 && obj.map(e => typeof e === 'number').reduce((a, b) => a && b, true);
+}
+
 interface PolylineCollectionOpts {
     offset_scale?: number;
+    offset_rotates_with_map?: boolean;
     color?: string;
     cmap?: ColorMap;
     line_width?: number;
+    line_style?: LineStyle | number[];
+}
+
+function makeDashTexture(gl: WebGLAnyRenderingContext, line_style: LineStyle) {
+
+    const dash_array = Array.isArray(line_style) ? line_style : dash_arrays[line_style];
+
+    const is_webgl2 = isWebGL2Ctx(gl);
+    const format = is_webgl2 ? gl.R8 : gl.LUMINANCE;
+    const type = gl.UNSIGNED_BYTE;
+    const row_alignment = 1;
+
+    const fill_image = {'format': format, 'type': type,
+        'width': dash_array.length, 'height': 1, 'image': new Uint8Array(dash_array.map(d => d > 0 ? 255 : 0)),
+        'mag_filter': gl.NEAREST, 'row_alignment': row_alignment,
+    };
+
+    return [dash_array.length, new WGLTexture(gl, fill_image)] as [number, WGLTexture];
 }
 
 class PolylineCollection {
     public readonly width: number;
     public readonly scale: number | null;
 
-    private readonly program: WGLProgram;
+    private readonly shader_manager: ShaderProgramManager;
 
     private readonly vertices: WGLBuffer;
     private readonly extrusion: WGLBuffer;
@@ -28,17 +65,20 @@ class PolylineCollection {
     private readonly offset: WGLBuffer | null;
     private readonly min_zoom: WGLBuffer | null;
     private readonly line_data: WGLBuffer | null;
-    private readonly line_texture: WGLTexture | null;
-    private readonly color: [number, number, number, number];
-    private readonly cmap_min: number;
-    private readonly cmap_max: number;
-    private readonly index_map: Float16Array | null;
-    private readonly cmap_nonlin_texture: WGLTexture | null;
+    private readonly color: Color;
+    private readonly cmap_gpu: ColorMapGPUInterface | null;
+    private readonly offset_rotates_with_map: boolean;
+    private readonly dash_texture: WGLTexture;
+    private readonly n_dash: number;
 
-    private constructor(gl: WebGLAnyRenderingContext, polyline: Polyline, opts: PolylineCollectionOpts) {
+    private constructor(gl: WebGLAnyRenderingContext, polyline: Polyline, opts?: PolylineCollectionOpts) {
         opts = opts === undefined ? {} : opts;
-        this.color = opts.color === undefined ? [0., 0., 0., 1.] : hex2rgba(opts.color);
+        const color_hex = opts.color === undefined ? '#000000' : opts.color;
+        this.color = Color.fromHex(color_hex);
+
         const line_width = opts.line_width === undefined ? 1 : opts.line_width;
+        const line_style = opts.line_style === undefined ? '-' : opts.line_style;
+        this.offset_rotates_with_map = opts.offset_rotates_with_map === undefined ? true : opts.offset_rotates_with_map;
 
         this.width = line_width;
 
@@ -65,47 +105,25 @@ class PolylineCollection {
             this.min_zoom = null;
         }
 
-        this.cmap_min = -3.40282347e+38;
-        this.cmap_max = 3.40282347e+38;
-
+        let fragment_src = polyline_fragment_src;
         if (polyline.data !== undefined) {
-            // TAS: this needs some cleanup (there's some repated code between here and the contour fills that should be combined?)
-            this.min_zoom = new WGLBuffer(gl, polyline.zoom, 1, gl.TRIANGLE_STRIP);
             shader_defines.push('DATA');
 
-            const {format: format_nonlin , type: type_nonlin, row_alignment: row_alignment_nonlin} = getGLFormatTypeAlignment(gl, true);
+            this.line_data = new WGLBuffer(gl, polyline.data, 1, gl.TRIANGLE_STRIP);
 
-            let tex_image: WGLTextureSpec
-            if (opts.cmap === undefined) {
-                tex_image = {'format': gl.RGBA, 'type': gl.UNSIGNED_BYTE, 'width': 1, 'height': 1, 'image': new Uint8Array(this.color), 'mag_filter': gl.NEAREST};
-                this.index_map = new Float16Array([0., 1.]);
-            }
-            else {
-                tex_image = {'format': gl.RGBA, 'type': gl.UNSIGNED_BYTE, 'image': makeTextureImage(opts.cmap), 'mag_filter': gl.NEAREST};
-                this.cmap_min = opts.cmap.levels[0];
-                this.cmap_max = opts.cmap.levels[opts.cmap.levels.length - 1];
+            const cmap = opts.cmap === undefined ? new ColorMap([0, 1], [color_hex], {overflow_color: color_hex, underflow_color: color_hex}) : opts.cmap;
+            this.cmap_gpu = new ColorMapGPUInterface(cmap);
+            this.cmap_gpu.setupShaderVariables(gl, gl.NEAREST);
 
-                this.index_map = makeIndexMap(opts.cmap);
-            }
-
-            const cmap_nonlin_image = {'format': format_nonlin, 'type': type_nonlin, 
-                'width': this.index_map.length, 'height': 1,
-                'image': new Uint16Array(this.index_map.buffer), 
-                'mag_filter': gl.LINEAR, 'row_alignment': row_alignment_nonlin,
-            };
-
-            this.cmap_nonlin_texture = new WGLTexture(gl, cmap_nonlin_image);
-    
-            this.line_texture = new WGLTexture(gl, tex_image);
-            this.line_data = new WGLBuffer(gl, polyline['data'], 1, gl.TRIANGLE_STRIP);
+            fragment_src = ColorMapGPUInterface.applyShader(fragment_src);
         }
         else {
-            this.line_texture = null;
             this.line_data = null;
-            this.index_map = null;
+            this.cmap_gpu = null;
         }
 
-        this.program = new WGLProgram(gl, polyline_vertex_src, polyline_fragment_src, {define: shader_defines});
+        [this.n_dash, this.dash_texture] = makeDashTexture(gl, line_style);
+        this.shader_manager = new ShaderProgramManager(polyline_vertex_src, fragment_src, shader_defines);
     }
 
     static async make(gl: WebGLAnyRenderingContext, lines: LineData[], opts?: PolylineCollectionOpts) {
@@ -113,54 +131,57 @@ class PolylineCollection {
         return new PolylineCollection(gl, polylines, opts);
     }
 
-    public render(gl: WebGLAnyRenderingContext, matrix: number[] | Float32Array, [map_width, map_height]: [number, number], map_zoom: number, map_bearing: number, map_pitch: number) {
-        if (matrix instanceof Float32Array)
-            matrix = [...matrix];
+    public render(gl: WebGLAnyRenderingContext, arg: RenderMethodArg, [map_width, map_height]: [number, number], map_zoom: number, map_bearing: number, map_pitch: number) {
+        const render_data = getRendererData(arg);
+        const program = this.shader_manager.getShaderProgram(gl, render_data.shaderData);
 
         const attributes: Record<string, WGLBuffer> = {'a_pos': this.vertices, 'a_extrusion': this.extrusion};
         const uniforms: Record<string, number | number[]> = {
-            'u_matrix': matrix, 'u_line_width': this.width, 'u_map_width': map_width, 'u_map_height': map_height, 'u_map_bearing': map_bearing, 'u_offset': 0
+            'u_line_width': this.width, 'u_map_width': map_width, 'u_map_height': map_height, 'u_offset': 0, 'u_zoom': map_zoom,
+            'u_dash_pattern_length': this.n_dash, ...this.shader_manager.getShaderUniforms(render_data)
         };
-        const textures: Record<string, WGLTexture> = {};
+        const textures: Record<string, WGLTexture> = {'u_dash_sampler': this.dash_texture};
 
-        if (this.offset !== null) {
+        if (this.offset !== null && this.scale !== null) {
             attributes['a_offset'] = this.offset;
             uniforms['u_offset_scale'] = this.scale * (map_height / map_width);
+            uniforms['u_offset_rotates_with_map'] = this.offset_rotates_with_map ? 1 : 0;
         }
 
         if (this.min_zoom !== null) {
             attributes['a_min_zoom'] = this.min_zoom;
-            uniforms['u_zoom'] = map_zoom;
         }
 
-        if (this.line_data !== null && this.line_texture !== null) {
+        if (this.line_data !== null) {
             attributes['a_data'] = this.line_data;
-            textures['u_cmap_sampler'] = this.line_texture;
-            textures['u_cmap_nonlin_sampler'] = this.cmap_nonlin_texture;
-            uniforms['u_cmap_min'] = this.cmap_min;
-            uniforms['u_cmap_max'] = this.cmap_max;
-            uniforms['u_n_index'] = this.index_map.length;
         }
         else {
-            uniforms['u_color'] = this.color;
+            uniforms['u_color'] = this.color.toRGBATuple();
         }
 
-        this.program.use(attributes, uniforms, textures);
+        program.use(attributes, uniforms, textures);
+
+        if (this.cmap_gpu !== null) {
+            this.cmap_gpu.bindShaderVariables(program);
+        }
 
         gl.enable(gl.BLEND);
         gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
-        this.program.draw();
+        program.draw();
 
-        this.program.setUniforms({'u_offset': -2});
-        this.program.draw();
+        if (render_data.type != 'maplibre' || !render_data.shaderData.define.includes('GLOBE')) {
+            program.setUniforms({'u_offset': -2});
+            program.draw();
 
-        this.program.setUniforms({'u_offset': -1});
-        this.program.draw();
+            program.setUniforms({'u_offset': -1});
+            program.draw();
 
-        this.program.setUniforms({'u_offset': 1});
-        this.program.draw();
+            program.setUniforms({'u_offset': 1});
+            program.draw();
+        }
     }
 }
 
-export {PolylineCollection};
+export {PolylineCollection, isLineStyle};
+export type {PolylineCollectionOpts, LineStyle};

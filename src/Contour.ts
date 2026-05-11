@@ -1,21 +1,29 @@
 
-import { LineData, TypedArray, WebGLAnyRenderingContext} from './AutumnTypes';
+import { LineData, RenderMethodArg, TypedArray, WebGLAnyRenderingContext } from './AutumnTypes';
 import { LngLat, MapLikeType } from './Map';
-import { PlotComponent, getGLFormatTypeAlignment } from './PlotComponent';
+import { PlotComponent } from './PlotComponent';
 import { RawScalarField } from './RawField';
-import { PolylineCollection } from './PolylineCollection';
+import { LineStyle, PolylineCollection, PolylineCollectionOpts, isLineStyle } from './PolylineCollection';
 import { TextCollection, TextCollectionOptions, TextSpec } from './TextCollection';
-import { WGLTexture } from 'autumn-wgl';
+import { Color } from './Color';
 
-import { hex2rgb, normalizeOptions } from './utils';
-import { kdTree } from 'kd-tree-javascript';
+import { normalizeOptions } from './utils';
+import { ColorMap } from './Colormap';
+import { StructuredGrid, UnstructuredGrid } from './Grid';
 
+/** Options for {@link Contour} components */
 interface ContourOptions {
     /** 
      * The color of the contours as a hex color string 
      * @default '#000000'
      */
     color?: string;
+
+    /**
+     * A color map to use to color the contours. Specifying a colormap overrides the color option.
+     * @default null
+     */
+    cmap?: ColorMap | null;
 
     /** 
      * The contour interval for drawing contours at regular intervals
@@ -24,10 +32,42 @@ interface ContourOptions {
     interval?: number;
 
     /**
-     * A list of arbitrary levels (up to 40) to contour. This overrides the `interval` option.
-     * @default Draw contours at regular intervals given by the `interval` option.
+     * A list of arbitrary levels to contour. This overrides the `interval` option.
+     * @default null
      */
-    levels?: number[];
+    levels?: number[] | null;
+
+    /**
+     * The width of the line in pixels. This could be either a number or a function that takes a contour level as a number and returns a line width. This
+     *  can be used to vary the width of the contours by value.
+     * @example level => level >= 100 ? 3 : 1.5
+     * @default 2
+     */
+    line_width?: number | ((level: number) => number);
+
+    /**
+     * The style to use for the line. This can be either a LineStyle or a function that takes a contour level as a number and returns a LineStyle. This 
+     *  can be used to vary the contours by value.
+     * @example level => level < 0 ? '--' : '-'
+     * @default '-'
+     */
+    line_style?: LineStyle | ((level: number) => LineStyle);
+
+
+    /**
+     * 
+     */
+    quad_as_tri?: boolean;
+}
+
+const contour_opt_defaults: Required<ContourOptions> = {
+    color: '#000000',
+    cmap: null,
+    interval: 1,
+    levels: null,
+    line_width: 2,
+    line_style: '-',
+    quad_as_tri: false
 }
 
 interface ContourGLElems<MapType extends MapLikeType> {
@@ -42,29 +82,23 @@ interface ContourGLElems<MapType extends MapLikeType> {
  * // meters).
  * const contours = new Contour(height_field, {color: '#000000', interval: 30});
  */
-class Contour<ArrayType extends TypedArray, MapType extends MapLikeType> extends PlotComponent<MapType> {
-    private field: RawScalarField<ArrayType>;
-    public readonly color: string;
-    public readonly interval: number;
-    public readonly levels: number[];
+class Contour<ArrayType extends TypedArray, GridType extends StructuredGrid, MapType extends MapLikeType> extends PlotComponent<MapType> {
+    private field: RawScalarField<ArrayType, GridType>;
+    public readonly opts: Required<ContourOptions>;
 
     private gl_elems: ContourGLElems<MapType> | null;
-    private contours: PolylineCollection | null;
+    private contours: PolylineCollection[] | null;
 
     /**
      * Create a contoured field
      * @param field - The field to contour
      * @param opts  - Options for creating the contours
      */
-    constructor(field: RawScalarField<ArrayType>, opts: ContourOptions) {
+    constructor(field: RawScalarField<ArrayType, GridType>, opts: ContourOptions) {
         super();
 
         this.field = field;
-
-        this.interval = opts.interval || 1;
-        this.levels = opts.levels || [];
-
-        this.color = opts.color || '#000000';
+        this.opts = normalizeOptions(opts, contour_opt_defaults);
 
         this.gl_elems = null;
         this.contours = null;
@@ -74,23 +108,68 @@ class Contour<ArrayType extends TypedArray, MapType extends MapLikeType> extends
      * Update the data displayed as contours
      * @param field - The new field to contour
      */
-    public async updateField(field: RawScalarField<ArrayType>) {
+    public async updateField(field: RawScalarField<ArrayType, GridType>) {
         this.field = field;
         if (this.gl_elems === null) return;
 
         const gl = this.gl_elems.gl;
 
         const contour_data = await this.getContours();
-        const line_data = Object.values(contour_data).flat().map(c => {
-            return {vertices: c} as LineData;
+
+        type LineDataStyleWidth = {data: LineData[], line_width: number, line_style: LineStyle};
+        const line_data: LineDataStyleWidth[] = [];
+
+        // Make contour data and sort them by line width and line style
+        Object.entries(contour_data).forEach(([cv, cd]) => {
+            const cv_ = parseFloat(cv);
+            const contour_style = isLineStyle(this.opts.line_style) ? this.opts.line_style : this.opts.line_style(cv_);
+            const contour_width = typeof this.opts.line_width === 'number' ? this.opts.line_width : this.opts.line_width(cv_);
+
+            const polyline_data = cd.map(c => {
+                const ld: LineData = {vertices: c};
+                if (this.opts.cmap !== null){
+                    ld.data = c.map(() => cv_)
+                }
+                return ld;
+            });
+
+            const line_data_filtered = line_data.filter(ld => ld.line_style == contour_style && ld.line_width == contour_width);
+            let contour_line_data: LineDataStyleWidth;
+            if (line_data_filtered.length == 0) {
+                contour_line_data = {data: [], line_width: contour_width, line_style: contour_style};
+                line_data.push(contour_line_data);
+            }
+            else {
+                contour_line_data = line_data_filtered[0];
+            }
+
+            contour_line_data.data = contour_line_data.data.concat(polyline_data);
         });
 
-        this.contours = await PolylineCollection.make(gl, line_data, {line_width: 2, color: this.color});
-        this.gl_elems.map.triggerRepaint();
+        // Make one PolylineCollection for each combination of line width and line style
+        const promises = line_data.map(async ld => {
+            const plc_opts: PolylineCollectionOpts = {line_width: ld.line_width, line_style: ld.line_style};
+            if (this.opts.cmap !== null) {
+                plc_opts.cmap = this.opts.cmap;
+            }
+            else {
+                plc_opts.color = this.opts.color;
+            }
+
+            return await PolylineCollection.make(gl, ld.data, plc_opts);
+        });
+
+        Promise.all(promises).then(values => {
+            if (this.gl_elems === null) return;
+
+            this.contours = values;
+            this.gl_elems.map.triggerRepaint();
+        });
     }
 
     public async getContours() {
-        return await this.field.getContours({interval: this.interval, levels: this.levels});
+        const levels = this.opts.levels === null ? undefined : this.opts.levels;
+        return await this.field.getContours({interval: this.opts.interval, levels: levels, quad_as_tri: this.opts.quad_as_tri});
     }
 
     /**
@@ -110,12 +189,9 @@ class Contour<ArrayType extends TypedArray, MapType extends MapLikeType> extends
      * @internal
      * Render the contours
      */
-    public render(gl: WebGLAnyRenderingContext, matrix: number[] | Float32Array) {
+    public render(gl: WebGLAnyRenderingContext, arg: RenderMethodArg) {
         if (this.gl_elems === null || this.contours === null) return;
         const gl_elems = this.gl_elems;
-
-        if (matrix instanceof Float32Array)
-            matrix = [...matrix];
 
         const zoom = gl_elems.map.getZoom();
         const map_width = gl_elems.map.getCanvas().width;
@@ -123,7 +199,7 @@ class Contour<ArrayType extends TypedArray, MapType extends MapLikeType> extends
         const bearing = gl_elems.map.getBearing();
         const pitch = gl_elems.map.getPitch();
 
-        this.contours.render(gl, matrix, [map_width, map_height], zoom, bearing, pitch);
+        this.contours.forEach(cnt => cnt.render(gl, arg, [map_width, map_height], zoom, bearing, pitch));
     }
 }
 
@@ -132,6 +208,7 @@ interface ContourLabelGLElems<MapType extends MapLikeType> {
     map: MapType;
 }
 
+/** Options for {@link ContourLabels} */
 interface ContourLabelOptions {
     /**
      * Number of decimal places to use in the contour labels
@@ -175,6 +252,12 @@ interface ContourLabelOptions {
     halo?: boolean;
 
     number_format?: Intl.NumberFormat;
+
+    /**
+     * Label density. 2 makes the labels twice as dense, 0.5 makes them half as dense.
+     * @default 1
+     */
+    density?: number;
 }
 
 const contour_label_opt_defaults: Required<ContourLabelOptions> = {
@@ -185,16 +268,25 @@ const contour_label_opt_defaults: Required<ContourLabelOptions> = {
     text_color: '#000000',
     halo_color: '#000000',
     halo: false,
-    number_format: null
+    number_format: null,
+    density: 1
 }
 
-class ContourLabels<ArrayType extends TypedArray, MapType extends MapLikeType> extends PlotComponent<MapType> {
-    private readonly contours: Contour<ArrayType, MapType>;
+/** 
+ * Label the contours on a plot 
+ * @example 
+ * // Contour some data
+ * const contours = new Contour(height_field, {color: '#000000', interval: 30});
+ * // Label the contours
+ * const labels = new ContourLabels(contours, {text_color: '#ffffff', halo: true});
+ */
+class ContourLabels<ArrayType extends TypedArray, GridType extends StructuredGrid, MapType extends MapLikeType> extends PlotComponent<MapType> {
+    private readonly contours: Contour<ArrayType, GridType, MapType>;
     private gl_elems: ContourLabelGLElems<MapType> | null;
     private text_collection: TextCollection | null;
     private readonly opts: Required<ContourLabelOptions>;
 
-    constructor(contours: Contour<ArrayType, MapType>, opts?: ContourLabelOptions) {
+    constructor(contours: Contour<ArrayType, GridType, MapType>, opts?: ContourLabelOptions) {
         super();
 
         this.opts = normalizeOptions(opts, contour_label_opt_defaults);
@@ -216,17 +308,23 @@ class ContourLabels<ArrayType extends TypedArray, MapType extends MapLikeType> e
         const map_style = map.getStyle();
 
         const font_url_template = this.opts.font_url_template == '' ? map_style.glyphs : this.opts.font_url_template;
-        const font_url = font_url_template.replace('{range}', '0-255').replace('{fontstack}', this.opts.font_face);
+        if (font_url_template === undefined)
+            throw "The map style doesn't have any glyph information. Please pass the font_url_template option to ContourLabels";
 
-        const label_pos: TextSpec[] = [];
+        const font_url = font_url_template.replace('{fontstack}', this.opts.font_face);
+
+        interface ContourLabelPlacement {
+            coord: {lon: number, lat: number};
+            text: string;
+        }
+        const label_pos: ContourLabelPlacement[] = [];
 
         const contour_data = await this.contours.getContours();
         const contour_levels = Object.keys(contour_data).map(parseFloat);
         contour_levels.sort((a, b) => a - b);
 
         const map_max_zoom = map.getMaxZoom();
-        const contour_label_spacing = 0.01 * Math.pow(2, 7 - map_max_zoom);
-        let min_label_lat: number = null, max_label_lat: number = null, min_label_lon: number = null, max_label_lon: number = null;
+        const contour_label_spacing = 0.006 / this.opts.density * Math.pow(2, 7 - map_max_zoom);
 
         Object.entries(contour_data).forEach(([level, contours]) => {
             const lvlF = parseFloat(level);
@@ -254,6 +352,8 @@ class ContourLabels<ArrayType extends TypedArray, MapType extends MapLikeType> e
                 let n_labels_placed = 0;
                 for (let idist = 1; idist < dist.length; idist++) {
                     const target_dist = contour_label_spacing * (n_labels_placed + (icntr / 2) % 1);
+                    // This works fine when contour_label_spacing > the spacing between points along a contour, but when you allow the map to zoom in
+                    //  (and therefore contour_label_spacing gets small), dist[idist] outruns target_dist, so it doesn't put any more labels after the first.
                     if (dist[idist - 1] <= target_dist && target_dist < dist[idist]) {
                         const pt1 = contour[idist - 1];
                         const pt2 = contour[idist];
@@ -262,60 +362,24 @@ class ContourLabels<ArrayType extends TypedArray, MapType extends MapLikeType> e
                         const pt_lon = (1 - alpha) * pt1[0] + alpha * pt2[0];
                         const pt_lat = (1 - alpha) * pt1[1] + alpha * pt2[1];
 
-                        if (min_label_lon === null || pt_lon < min_label_lon) min_label_lon = pt_lon;
-                        if (max_label_lon === null || pt_lon > max_label_lon) max_label_lon = pt_lon;
-                        if (min_label_lat === null || pt_lat < min_label_lat) min_label_lat = pt_lat;
-                        if (max_label_lat === null || pt_lat > max_label_lat) max_label_lat = pt_lat;
-
-                        label_pos.push({lon: pt_lon, lat: pt_lat, min_zoom: map_max_zoom, text: level_str});
+                        label_pos.push({coord: {lon: pt_lon, lat: pt_lat}, text: level_str});
                         n_labels_placed++;
                     }
                 }
             });
         });
 
-        const tree = new kdTree(label_pos, (a, b) => Math.hypot(a.lon - b.lon, a.lat - b.lat), ['lon', 'lat']);
-
-        const {x: min_label_x, y: max_label_y} = new LngLat(min_label_lon, min_label_lat).toMercatorCoord();
-        const {x: max_label_x, y: min_label_y} = new LngLat(max_label_lon, max_label_lat).toMercatorCoord();
-        const thin_grid_width = max_label_x - min_label_x;
-        const thin_grid_height = max_label_y - min_label_y;
-        const ni_thin_grid = Math.round(4 * thin_grid_width / contour_label_spacing);
-        const nj_thin_grid = Math.round(4 * thin_grid_height / contour_label_spacing);
-        const thin_grid_xs = [];
-        const thin_grid_ys = [];
-
-        for (let idx = 0; idx < ni_thin_grid; idx++) {
-            thin_grid_xs.push(min_label_x + (idx / ni_thin_grid) * thin_grid_width);
-        }
-
-        for (let jdy = 0; jdy < nj_thin_grid; jdy++) {
-            thin_grid_ys.push(min_label_y + (jdy / nj_thin_grid) * thin_grid_height);
-        }
-
-        let skip = 1;
-        for (let zoom = map_max_zoom - 1; zoom >= 0; zoom--) {        
-            for (let idx = 0; idx < ni_thin_grid; idx += skip) {
-                for (let jdy = 0; jdy < nj_thin_grid; jdy += skip) {
-                    const grid_x = thin_grid_xs[idx];
-                    const grid_y = thin_grid_ys[jdy];
-                    const ll = LngLat.fromMercatorCoord(grid_x, grid_y);
-
-                    const [label, dist] = tree.nearest({lon: ll.lng, lat: ll.lat, min_zoom: 0, text: ""}, 1)[0];
-                    label.min_zoom = zoom;
-                }
-            }
-
-            skip *= 2;
-        }
+        const label_grid = new UnstructuredGrid(label_pos.map(lp => lp.coord));
+        const min_zoom = label_grid.getMinVisibleZoom(4);
+        const text_specs: TextSpec[] = label_pos.map((lp, ilp) => ({...lp.coord, min_zoom: min_zoom[ilp], text: lp.text}));
 
         const tc_opts: TextCollectionOptions = {
             horizontal_align: 'center', vertical_align: 'middle', font_size: this.opts.font_size,
             halo: this.opts.halo, 
-            text_color: hex2rgb(this.opts.text_color), halo_color: hex2rgb(this.opts.halo_color),
+            text_color: Color.fromHex(this.opts.text_color), halo_color: Color.fromHex(this.opts.halo_color),
         };
 
-        this.text_collection = await TextCollection.make(gl, label_pos, font_url, tc_opts);
+        this.text_collection = await TextCollection.make(gl, text_specs, font_url, tc_opts);
         map.triggerRepaint();
     }
 
@@ -335,7 +399,7 @@ class ContourLabels<ArrayType extends TypedArray, MapType extends MapLikeType> e
      * @internal 
      * Render the contour labels
      */
-    public render(gl: WebGLAnyRenderingContext, matrix: number[]) {
+    public render(gl: WebGLAnyRenderingContext, arg: RenderMethodArg) {
         if (this.gl_elems === null || this.text_collection === null) return;
         const gl_elems = this.gl_elems;
 
@@ -343,7 +407,7 @@ class ContourLabels<ArrayType extends TypedArray, MapType extends MapLikeType> e
         const map_height = gl_elems.map.getCanvas().height;
         const map_zoom = gl_elems.map.getZoom();
 
-        this.text_collection.render(gl, matrix, [map_width, map_height], map_zoom);
+        this.text_collection.render(gl, arg, [map_width, map_height], map_zoom);
     }
 }
 

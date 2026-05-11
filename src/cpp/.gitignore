@@ -2,6 +2,8 @@
 *.wasm
 *.exe
 
-marchingsquares
+marchingsquares.exe
 marchingsquares.js
 marchingsquares_embind.d.ts
+marchingsquares.exe.dSYM
+map.exe

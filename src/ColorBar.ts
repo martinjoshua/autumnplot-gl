@@ -1,11 +1,29 @@
 
-import { Color, ColorMap } from "./Colormap";
+import { ColorMap } from "./Colormap";
+import { Color } from "./Color";
 
+/** The orientation for color bars (horizontal or vertical) */
 type ColorbarOrientation = 'horizontal' | 'vertical';
+
+/** Which side of a color bar the ticks are on */
 type ColorbarTickDirection = 'top' | 'bottom' | 'left' | 'right';
+
+/** Options for {@link ColorBar}s */
 interface ColorBarOptions {
     /** The label to place along the color bar */
     label?: string;
+
+    /** 
+     * The size in pixels along the long axis of the colorbar 
+     * @default 600
+     */
+    size_long?: number;
+
+    /**
+     * The size in pixels along the short axis of the colorbar
+     * @default size_long / 9
+     */
+    size_short?: number;
 
     /** 
      * An array of numbers to use as the tick locations. 
@@ -37,6 +55,12 @@ interface ColorBarOptions {
      * @default 12
      */
     ticklabelsize?: number;
+
+    /**
+     * The color for the color bar outline and the text
+     * @default '#000000'
+     */
+    outline_and_text_color?: string;
 };
 
 const createElement = (tagname: string, attributes?: Record<string, string | number>, parent?: SVGElement) => {
@@ -74,6 +98,9 @@ function makeColorBar(colormap: ColorMap, opts: ColorBarOptions) {
     const orientation = opts.orientation || 'vertical';
     const fontface = opts.fontface || 'sans-serif';
     const tickfontsize = opts.ticklabelsize || 12;
+    const size_long = opts.size_long || 600;
+    const size_short = opts.size_short || size_long / 9;
+    const outline_and_text_color = opts.outline_and_text_color || '#000000';
 
     const tick_dir = opts.tick_direction || (orientation == 'vertical' ? 'left' : 'bottom');
 
@@ -90,8 +117,8 @@ function makeColorBar(colormap: ColorMap, opts: ColorBarOptions) {
     const chars_right = getNChar(ticks[ticks.length - 1]);
     const need_overflow = colormap.underflow_color !== null || colormap.overflow_color !== null;
 
-    const bar_long_size = 600;
-    const bar_cross_size = bar_long_size / 9;
+    const bar_long_size = size_long;
+    const bar_cross_size = size_short;
     const bar_long_pad = Math.max(orientation == 'horizontal' ? Math.max(chars_left, chars_right) * 6 : 8, 
                                   need_overflow ? bar_cross_size / (2 * Math.sqrt(3)) : 0);
     const bar_cross_pad = 3;
@@ -159,7 +186,7 @@ function makeColorBar(colormap: ColorMap, opts: ColorBarOptions) {
             attrs = {x: bar_left + bar_width * icolor / n_colors, y: bar_top, width: bar_width / n_colors, height: bar_height};
         }
 
-        createElement('rect', {...attrs, fill: color.color, opacity: color.opacity}, gbar);
+        createElement('rect', {...attrs, fill: color.toRGBHex(), opacity: color.a}, gbar);
     });
 
     // Make the overflow and underflow triangles
@@ -172,7 +199,7 @@ function makeColorBar(colormap: ColorMap, opts: ColorBarOptions) {
             point_list = `${bar_left} ${bar_bottom}, ${bar_low_arrow} ${bar_middle}, ${bar_left} ${bar_top}, ${bar_left} ${bar_bottom}`;
         }
 
-        const underflow_attrs = {points: point_list, fill: colormap.underflow_color.color, opacity: colormap.underflow_color.opacity};
+        const underflow_attrs = {points: point_list, fill: colormap.underflow_color.toRGBHex(), opacity: colormap.underflow_color.a};
         createElement('polygon', underflow_attrs, gbar);
     }
 
@@ -185,7 +212,7 @@ function makeColorBar(colormap: ColorMap, opts: ColorBarOptions) {
             point_list = `${bar_right} ${bar_top}, ${bar_high_arrow} ${bar_middle}, ${bar_right} ${bar_bottom}, ${bar_right} ${bar_top}`;
         }
 
-        const overflow_attrs = {points: point_list, fill: colormap.overflow_color.color, opacity: colormap.overflow_color.opacity};
+        const overflow_attrs = {points: point_list, fill: colormap.overflow_color.toRGBHex(), opacity: colormap.overflow_color.a};
         createElement('polygon', overflow_attrs, gbar);
     }
 
@@ -211,7 +238,7 @@ function makeColorBar(colormap: ColorMap, opts: ColorBarOptions) {
             lineattrs = tick_dir == 'bottom' ? {y2 : 6} : {y2: -6};
         }
 
-        createElement('line', {...lineattrs, stroke: '#000000', 'stroke-width': 1.5}, gtick);
+        createElement('line', {...lineattrs, stroke: outline_and_text_color, 'stroke-width': 1.5}, gtick);
 
         let textattrs;
         if (orientation == 'vertical') {
@@ -221,7 +248,7 @@ function makeColorBar(colormap: ColorMap, opts: ColorBarOptions) {
             textattrs = tick_dir == 'bottom' ? {y: 9, dy: '0.8em'} : {y: -9, dy: '0em'};
         }
 
-        const text = createElement('text', {...textattrs, fill: '#000000', style: `font-family: ${fontface}; font-size: ${tickfontsize}pt`}, gtick);
+        const text = createElement('text', {...textattrs, fill: outline_and_text_color, style: `font-family: ${fontface}; font-size: ${tickfontsize}pt`}, gtick);
         text.textContent = level.toString();
     });
 
@@ -238,7 +265,7 @@ function makeColorBar(colormap: ColorMap, opts: ColorBarOptions) {
 
     const outline_attrs = {
         points: point_list,
-        stroke: '#000000',
+        stroke: outline_and_text_color,
         'stroke-width': 1.5,
         fill: 'none'
     };
@@ -252,12 +279,13 @@ function makeColorBar(colormap: ColorMap, opts: ColorBarOptions) {
     else {
         labelattrs = tick_dir == 'bottom' ? {transform: `translate(${width / 2}, ${height - 5})`} : {transform: `translate(${width / 2}, 15)`}
     }
-    const label_elem = createElement('text', {...labelattrs, fill: '#000000', 'text-anchor': 'middle', style: `font-family: ${fontface};`}, root);
+    const label_elem = createElement('text', {...labelattrs, fill: outline_and_text_color, 'text-anchor': 'middle', style: `font-family: ${fontface};`}, root);
     label_elem.textContent = label;
 
     return root;
 }
 
+/** Options for {@link makePaintballKey | makePaintballKey()} */
 interface PaintballKeyOptions {
     /**
      * The number of columns of entries in the key
@@ -319,8 +347,8 @@ function makePaintballKey(colors: (Color | string)[], labels: string[], opts?: P
 
         let opacity = 1.;
         if (typeof color != 'string') {
-            opacity = color.opacity;
-            color = color.color;
+            opacity = color.a;
+            color = color.toRGBHex();
         }
 
         const x = swatch_width_pad + icol * (swatch_width + swatch_text_pad + swatch_text_space + swatch_width_pad);

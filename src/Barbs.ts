@@ -1,12 +1,15 @@
 
 import { PlotComponent } from "./PlotComponent";
 import { BillboardCollection } from './BillboardCollection';
-import { hex2rgba } from './utils';
+import { normalizeOptions } from './utils';
 import { RawVectorField } from "./RawField";
 import { MapLikeType } from "./Map";
-import { TypedArray, WebGLAnyRenderingContext } from "./AutumnTypes";
+import { BillboardSpec, RenderMethodArg, TypedArray, WebGLAnyRenderingContext } from "./AutumnTypes";
+import { Color } from "./Color";
+import { ColorMap } from "./Colormap";
+import { Grid } from "./Grid";
 
-const BARB_DIMS = {
+const BASE_BARB_DIMS: BillboardSpec = {
     BB_WIDTH: 85,
     BB_HEIGHT: 256,
     BB_TEX_WIDTH: 1024,
@@ -16,14 +19,16 @@ const BARB_DIMS = {
     BB_MAG_BIN_SIZE: 5,
 }
 
-function _createBarbTexture() : HTMLCanvasElement {
+const LINE_WIDTH_MULTIPLIER = 4;
+
+function createBarbTexture(dimensions: BillboardSpec, line_width: number) : HTMLCanvasElement {
     let canvas = document.createElement('canvas');
 
-    canvas.width = BARB_DIMS.BB_TEX_WIDTH;
-    canvas.height = BARB_DIMS.BB_TEX_HEIGHT;
+    canvas.width = dimensions.BB_TEX_WIDTH;
+    canvas.height = dimensions.BB_TEX_HEIGHT;
     
     function drawWindBarb(ctx: CanvasRenderingContext2D, tipx: number, tipy: number, mag: number) : void {
-        const elem_full_size = BARB_DIMS.BB_WIDTH / 2 - 4;
+        const elem_full_size = dimensions.BB_WIDTH / 2 - 4;
         const elem_spacing = elem_full_size / 2;
         
         if (mag < 2.5) {
@@ -110,26 +115,42 @@ function _createBarbTexture() : HTMLCanvasElement {
         throw "Could not get rendering context for the wind barb canvas";
     }
 
-    ctx.lineWidth = 8;
+    ctx.lineWidth = line_width;
     ctx.miterLimit = 4;
     
-    for (let ibarb = 0; ibarb <= BARB_DIMS.BB_MAG_MAX; ibarb += BARB_DIMS.BB_MAG_BIN_SIZE) {
-        const x_pos = (ibarb % BARB_DIMS.BB_MAG_WRAP) / BARB_DIMS.BB_MAG_BIN_SIZE * BARB_DIMS.BB_WIDTH + BARB_DIMS.BB_WIDTH / 2;
-        const y_pos = Math.floor(ibarb / BARB_DIMS.BB_MAG_WRAP) * BARB_DIMS.BB_HEIGHT + BARB_DIMS.BB_WIDTH / 2;
+    for (let ibarb = 0; ibarb <= dimensions.BB_MAG_MAX; ibarb += dimensions.BB_MAG_BIN_SIZE) {
+        const x_pos = (ibarb % dimensions.BB_MAG_WRAP) / dimensions.BB_MAG_BIN_SIZE * dimensions.BB_WIDTH + dimensions.BB_WIDTH / 2;
+        const y_pos = Math.floor(ibarb / dimensions.BB_MAG_WRAP) * dimensions.BB_HEIGHT + dimensions.BB_WIDTH / 2;
         drawWindBarb(ctx, x_pos, y_pos, ibarb);
     }
 
     return canvas;
 }
 
-let BARB_TEXTURE: HTMLCanvasElement | null = null;
-
+/** Options for {@link Barbs} components */
 interface BarbsOptions {
     /** 
      * The color to use for the barbs as a hex color string;.
      * @default '#000000'
      */
     color?: string;
+
+    /**
+     * A color map to use to color the barbs by magnitude. Specifying cmap overrides the color argument.
+     */
+    cmap?: ColorMap | null;
+
+    /**
+     * The width of the lines to use for the barbs
+     * @default 2
+     */
+    line_width?: number;
+
+    /**
+     * A multiplier for the barb size
+     * @default 1
+     */
+    barb_size_multiplier?: number;
 
     /** 
      * How much to thin the barbs at zoom level 1 on the map. This effectively means to plot every `n`th barb in the i and j directions, where `n` = 
@@ -139,9 +160,17 @@ interface BarbsOptions {
     thin_fac?: number;
 }
 
-interface BarbsGLElems<ArrayType extends TypedArray, MapType extends MapLikeType> {
+const barb_opt_defaults: Required<BarbsOptions> = {
+    color: '#000000',
+    cmap: null,
+    line_width: 2,
+    barb_size_multiplier: 1, 
+    thin_fac: 1
+}
+
+interface BarbsGLElems<ArrayType extends TypedArray, GridType extends Grid, MapType extends MapLikeType> {
     map: MapType;
-    barb_billboards: BillboardCollection<ArrayType>;
+    barb_billboards: BillboardCollection<ArrayType, GridType>;
 }
 
 /** 
@@ -152,27 +181,28 @@ interface BarbsGLElems<ArrayType extends TypedArray, MapType extends MapLikeType
  * const vector_field = new RawVectorField(grid, u_data, v_data);
  * const barbs = new Barbs(vector_field, {color: '#000000', thin_fac: 16});
  */
-class Barbs<ArrayType extends TypedArray, MapType extends MapLikeType> extends PlotComponent<MapType> {
+class Barbs<ArrayType extends TypedArray, GridType extends Grid, MapType extends MapLikeType> extends PlotComponent<MapType> {
     /** The vector field */
-    private fields: RawVectorField<ArrayType>;
-    public readonly color: [number, number, number];
-    public readonly thin_fac: number;
+    private fields: RawVectorField<ArrayType, GridType>;
+    public readonly opts: Required<BarbsOptions>;
+    private readonly color: Color;
 
-    private gl_elems: BarbsGLElems<ArrayType, MapType> | null;
+    private gl_elems: BarbsGLElems<ArrayType, GridType, MapType> | null;
+    private barb_texture: HTMLCanvasElement;
 
     /**
      * Create a field of wind barbs
      * @param fields - The vector field to plot as barbs
      * @param opts   - Options for creating the wind barbs
      */
-    constructor(fields: RawVectorField<ArrayType>, opts: BarbsOptions) {
+    constructor(fields: RawVectorField<ArrayType, GridType>, opts: BarbsOptions) {
         super();
 
         this.fields = fields;
 
-        const color = hex2rgba(opts.color || '#000000');
-        this.color = [color[0], color[1], color[2]];
-        this.thin_fac = opts.thin_fac || 1;
+        this.opts = normalizeOptions(opts, barb_opt_defaults);
+        this.color = Color.fromHex(this.opts.color);
+        this.barb_texture = createBarbTexture(BASE_BARB_DIMS, this.opts.line_width / this.opts.barb_size_multiplier * LINE_WIDTH_MULTIPLIER);
 
         this.gl_elems = null;
     }
@@ -181,7 +211,7 @@ class Barbs<ArrayType extends TypedArray, MapType extends MapLikeType> extends P
      * Update the field displayed as barbs
      * @param fields - The new field to display as barbs
      */
-    public async updateField(fields: RawVectorField<ArrayType>) {
+    public async updateField(fields: RawVectorField<ArrayType, GridType>) {
         this.fields = fields;
         if (this.gl_elems === null) return;
         this.gl_elems.barb_billboards.updateField(fields);
@@ -198,14 +228,11 @@ class Barbs<ArrayType extends TypedArray, MapType extends MapLikeType> extends P
         
         const map_max_zoom = map.getMaxZoom();
 
-        if (BARB_TEXTURE === null) {
-            BARB_TEXTURE = _createBarbTexture();
-        }
+        const barb_image = {format: gl.RGBA, type: gl.UNSIGNED_BYTE, image: this.barb_texture, mag_filter: gl.NEAREST};
 
-        const barb_image = {format: gl.RGBA, type: gl.UNSIGNED_BYTE, image: BARB_TEXTURE, mag_filter: gl.NEAREST};
-
-        const barb_billboards = new BillboardCollection(this.fields, this.thin_fac, map_max_zoom, barb_image, 
-            BARB_DIMS, this.color, 0.1);
+        const cmap = this.opts.cmap === null ? undefined : this.opts.cmap;
+        const barb_billboards = new BillboardCollection(this.fields, this.opts.thin_fac, map_max_zoom, barb_image, 
+            BASE_BARB_DIMS, 0.1 * this.opts.barb_size_multiplier, {color: this.color, cmap: cmap});
         await barb_billboards.setup(gl);
 
         this.gl_elems = {
@@ -219,7 +246,7 @@ class Barbs<ArrayType extends TypedArray, MapType extends MapLikeType> extends P
      * @internal 
      * Render the barb field
      */
-    public render(gl: WebGLAnyRenderingContext, matrix: number[] | Float32Array) {
+    public render(gl: WebGLAnyRenderingContext, matrix: RenderMethodArg) {
         if (this.gl_elems === null) return;
         const gl_elems = this.gl_elems
 

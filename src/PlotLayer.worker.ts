@@ -5,22 +5,14 @@ import { LineData, Polyline } from "./AutumnTypes";
 import * as Comlink from 'comlink';
 import { LngLat } from "./Map";
 
-function makeBBElements(field_lats: Float32Array, field_lons: Float32Array, field_ni: number, field_nj: number,
-    thin_fac_base: number, max_zoom: number) {
+function makeBBElements(field_lats: Float32Array, field_lons: Float32Array, min_zoom: Uint8Array, field_ni: number, field_nj: number, map_max_zoom: number) {
         
-    const n_pts_per_poly = 6;
-    const n_coords_per_pt_pts = 3;
+    const n_coords_per_pt_pts = 2;
     const n_coords_per_pt_tc = 2;
 
-    const n_density_tiers = Math.log2(thin_fac_base);
-    const n_inaccessible_tiers = Math.max(n_density_tiers + 1 - max_zoom, 0);
-    const trim_inaccessible = Math.pow(2, n_inaccessible_tiers);
-
-    const field_ni_access = Math.floor((field_ni - 1) / trim_inaccessible) + 1;
-    const field_nj_access = Math.floor((field_nj - 1) / trim_inaccessible) + 1;
-
-    const n_elems_pts = field_ni_access * field_nj_access * n_pts_per_poly * n_coords_per_pt_pts;
-    const n_elems_tc = field_ni_access * field_nj_access * n_pts_per_poly * n_coords_per_pt_tc;
+    const field_n_access = min_zoom.filter(mz => mz <= map_max_zoom).length;
+    const n_elems_pts = field_n_access * n_coords_per_pt_pts;
+    const n_elems_tc = field_n_access * n_coords_per_pt_tc;
 
     let pts = new Float32Array(n_elems_pts);
     let tex_coords = new Float32Array(n_elems_tc);
@@ -33,28 +25,23 @@ function makeBBElements(field_lats: Float32Array, field_lons: Float32Array, fiel
             const idx = ilat * field_ni + ilon;
             const lat = field_lats[idx];
             const lon = field_lons[idx];
+            const zoom = min_zoom[idx];
 
-            const zoom = getMinZoom(ilat, ilon, thin_fac_base);
-
-            if (zoom > max_zoom) continue;
+            if (zoom > map_max_zoom || lon === undefined || lat === undefined) continue; // TAS: Adding the checks for lat/lon here may be a bug waiting to happen? Not sure.
 
             const pt_ll = new LngLat(lon, lat).toMercatorCoord();
 
-            // These contain a degenerate triangle on either end to imitate primitive restarting
-            //  (see https://groups.google.com/g/webgl-dev-list/c/KLfiwj4jax0/m/cKiezrhRz8MJ?pli=1)
-            for (let icrnr = 0; icrnr < n_pts_per_poly; icrnr++) {
-                const actual_icrnr = Math.max(0, Math.min(icrnr - 1, 3));
+            pts[istart_pts + 0] = pt_ll.x; 
+            pts[istart_pts + 1] = pt_ll.y; 
 
-                pts[istart_pts + icrnr * n_coords_per_pt_pts + 0] = pt_ll.x; 
-                pts[istart_pts + icrnr * n_coords_per_pt_pts + 1] = pt_ll.y; 
-                pts[istart_pts + icrnr * n_coords_per_pt_pts + 2] = zoom * 4 + actual_icrnr;
+            // Pack the min zoom in with the texture coordinates; only works because the min zoom is always an integer
+            // Another gotcha is that if the i texcoord is 1, then that bump up the zoom that gets unpacked on the GPU, which causes may cause the last column of billboards to
+            //  disappear. To fix this, cap the texcoord at 0.99999, which should be good for textures up to 10^5 pixels in size.
+            tex_coords[istart_tc + 0] = Math.min(ilon / (field_ni - 1), 0.99999) + zoom;
+            tex_coords[istart_tc + 1] = ilat / (field_nj - 1);
 
-                tex_coords[istart_tc + icrnr * n_coords_per_pt_tc + 0] = ilon / (field_ni - 1);
-                tex_coords[istart_tc + icrnr * n_coords_per_pt_tc + 1] = ilat / (field_nj - 1);
-            }
-
-            istart_pts += (n_pts_per_poly * n_coords_per_pt_pts);
-            istart_tc += (n_pts_per_poly * n_coords_per_pt_tc);
+            istart_pts += n_coords_per_pt_pts;
+            istart_tc += n_coords_per_pt_tc;
         }
     }
 
@@ -64,7 +51,6 @@ function makeBBElements(field_lats: Float32Array, field_lons: Float32Array, fiel
 function makeDomainVerticesAndTexCoords(field_lats: Float32Array, field_lons: Float32Array, field_ni: number, field_nj: number, texcoord_margin_r: number, texcoord_margin_s: number) {
     const verts = new Float32Array(2 * 2 * (field_ni - 1) * (field_nj + 1)).fill(0);
     const tex_coords = new Float32Array(2 * 2 * (field_ni - 1) * (field_nj + 1)).fill(0);
-    const grid_cell_size = new Float32Array(1 * 2 * (field_ni - 1) * (field_nj + 1)).fill(0);
 
     let ivert = 0
     let itexcoord = 0;
@@ -106,35 +92,7 @@ function makeDomainVerticesAndTexCoords(field_lats: Float32Array, field_lons: Fl
         }
     }
 
-    let igcs = 0;
-    for (let i = 0; i < field_ni - 1; i++) {
-        for (let j = 0; j < field_nj - 1; j++) {
-            const ivert = j == 0 ? 2 * (igcs + 1) : 2 * igcs;
-            const x_ll = verts[ivert],     y_ll = verts[ivert + 1],
-                  x_lr = verts[ivert + 2], y_lr = verts[ivert + 3],
-                  x_ul = verts[ivert + 4], y_ul = verts[ivert + 5],
-                  x_ur = verts[ivert + 6], y_ur = verts[ivert + 7];
-
-            const area = 0.5 * Math.abs(x_ll * (y_lr - y_ul) + x_lr * (y_ul - y_ll) + x_ul * (y_ll - y_lr) + 
-                                        x_ur * (y_ul - y_lr) + x_ul * (y_lr - y_ur) + x_lr * (y_ur - y_ul));
-
-            if (j == 0) {
-                grid_cell_size[igcs] = area;
-                igcs += 1;
-            }
-
-            grid_cell_size[igcs] = area; grid_cell_size[igcs + 1] = area;
-            igcs += 2;
-
-            if (j == field_nj - 2) {
-                grid_cell_size[igcs] = area; grid_cell_size[igcs + 1] = area; 
-                grid_cell_size[igcs + 2] = area;
-                igcs += 3;
-            }
-        }
-    }
-
-    return {'vertices': verts, 'tex_coords': tex_coords, 'grid_cell_size': grid_cell_size};
+    return {'vertices': verts, 'tex_coords': tex_coords};
 }
 
 /*
@@ -270,6 +228,10 @@ function makePolylinesMiter(lines) {
 */
 
 function makePolylines(lines: LineData[]) : Polyline {
+    if (lines.length == 0 || lines[0].vertices.length == 0) {
+        return {vertices: new Float32Array([]), extrusion: new Float32Array([])};
+    }
+
     const n_points_per_vert = Object.fromEntries(Object.entries(lines[0]).map(([k, v]) => {
         let n_verts: number;
         if (typeof v === 'number') {
@@ -326,12 +288,16 @@ function makePolylines(lines: LineData[]) : Polyline {
             return [v_ll.x, v_ll.y] as [number, number];
         });
 
+        if (line.vertices.length == 0) {
+            return;
+        }
+
         const has_offsets = line.offsets !== undefined;
-        const extrusion_verts = has_offsets ? line.offsets : verts;
+        const extrusion_verts = line.offsets !== undefined ? line.offsets : verts;
 
         let pt_prev: [number, number], pt_this = verts[0], pt_next = verts[1];
         let ept_prev: [number, number], ept_this = extrusion_verts[0], ept_next = extrusion_verts[1];
-        let len_prev: number, len_this = 0;
+        let len_prev: number, len_this = 0.0001;
         let [ext_x, ext_y] = compute_normal_vec(ept_this, ept_next, !has_offsets);
 
         ret.vertices[ilns.vertices++] = pt_this[0]; ret.vertices[ilns.vertices++] = pt_this[1]; ret.vertices[ilns.vertices++] = len_this;
@@ -344,10 +310,10 @@ function makePolylines(lines: LineData[]) : Polyline {
             [ext_x, ext_y] = compute_normal_vec(ept_prev, ept_this, !has_offsets);
             len_prev = len_this; len_this += Math.hypot(verts[ivt - 1][0] - verts[ivt][0], verts[ivt - 1][1] - verts[ivt][1]);
 
-            ret.vertices[ilns.vertices++] = pt_prev[0]; ret.vertices[ilns.vertices++] = pt_prev[1]; ret.vertices[ilns.vertices++] = len_prev;
+            ret.vertices[ilns.vertices++] = pt_prev[0]; ret.vertices[ilns.vertices++] = pt_prev[1]; ret.vertices[ilns.vertices++] = -len_prev;
             ret.vertices[ilns.vertices++] = pt_prev[0]; ret.vertices[ilns.vertices++] = pt_prev[1]; ret.vertices[ilns.vertices++] = len_prev;
 
-            ret.vertices[ilns.vertices++] = pt_this[0]; ret.vertices[ilns.vertices++] = pt_this[1]; ret.vertices[ilns.vertices++] = len_this;
+            ret.vertices[ilns.vertices++] = pt_this[0]; ret.vertices[ilns.vertices++] = pt_this[1]; ret.vertices[ilns.vertices++] = -len_this;
             ret.vertices[ilns.vertices++] = pt_this[0]; ret.vertices[ilns.vertices++] = pt_this[1]; ret.vertices[ilns.vertices++] = len_this;
 
             ret.extrusion[ilns.extrusion++] =  ext_x; ret.extrusion[ilns.extrusion++] =  ext_y;
@@ -360,7 +326,7 @@ function makePolylines(lines: LineData[]) : Polyline {
         ret.vertices[ilns.vertices++] = pt_this[0]; ret.vertices[ilns.vertices++] = pt_this[1]; ret.vertices[ilns.vertices++] = len_this;
         ret.extrusion[ilns.extrusion++] = -ext_x; ret.extrusion[ilns.extrusion++] = -ext_y;
 
-        if ('offsets' in ret) {
+        if (ret.offsets !== undefined && line.offsets !== undefined) {
             const offsets = line.offsets;
             let off_prev: [number, number], off_this = offsets[0];
 
@@ -378,7 +344,7 @@ function makePolylines(lines: LineData[]) : Polyline {
             ret.offsets[ilns.offsets++] = off_this[0]; ret.offsets[ilns.offsets++] = off_this[1];
         }
 
-        if ('data' in ret) {
+        if (ret.data !== undefined && line.data !== undefined) {
             const data = line.data;
             let data_prev: number, data_this = data[0];
 
@@ -396,7 +362,7 @@ function makePolylines(lines: LineData[]) : Polyline {
             ret.data[ilns.data++] = data_this;
         }
         
-        if ('zoom' in ret) {
+        if (ret.zoom !== undefined && line.zoom !== undefined) {
             for (let ivt = 0; ivt < verts.length * 4 - 2; ivt++) {
                 ret.zoom[ilns.zoom++] = line['zoom'];
             }

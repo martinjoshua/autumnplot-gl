@@ -4,33 +4,40 @@ import * as Comlink from 'comlink';
 import { getOS } from "./utils";
 import { PlotLayerWorker } from './PlotLayer.worker';
 import { MapLikeType } from './Map';
-import { WebGLAnyRenderingContext, isWebGL2Ctx } from './AutumnTypes';
+import { RenderMethodArg, TypedArrayStr, WebGLAnyRenderingContext, isWebGL2Ctx } from './AutumnTypes';
 
 const worker = new Worker(new URL('./PlotLayer.worker', import.meta.url));
 const layer_worker = Comlink.wrap<PlotLayerWorker>(worker);
 
+/** Base class for all plot components */
 abstract class PlotComponent<MapType extends MapLikeType> {
     public abstract onAdd(map: MapType, gl: WebGLAnyRenderingContext) : Promise<void>;
-    public abstract render(gl: WebGLAnyRenderingContext, matrix: number[] | Float32Array) : void;
+    public abstract render(gl: WebGLAnyRenderingContext, arg: RenderMethodArg) : void;
 }
 
-function getGLFormatTypeAlignment(gl: WebGLAnyRenderingContext, is_float16: boolean) {
+function getGLFormatTypeAlignment(gl: WebGLAnyRenderingContext, array_dtype: TypedArrayStr) {
     let format, type, row_alignment;
     const is_webgl2 = isWebGL2Ctx(gl);
 
-    if (is_float16) {
+    if (array_dtype == 'float16') {
         const ext = gl.getExtension('OES_texture_half_float');
         const ext_lin = gl.getExtension('OES_texture_half_float_linear');
 
-        if ((!is_webgl2 && ext === null) || (!is_webgl2 && ext_lin === null)) {
-            throw "Float16 data are not supported on this hardware. Try Float32 data instead.";
+        if (is_webgl2) {
+            format = gl.R16F;
+            type = gl.HALF_FLOAT;
+        }
+        else {
+            if (ext === null || ext_lin === null)
+                throw "Float16 data are not supported on this hardware. Try Float32 data instead.";
+
+            format = gl.LUMINANCE;
+            type = ext.HALF_FLOAT_OES;
         }
 
-        format = is_webgl2 ? gl.R16F : gl.LUMINANCE;
-        type = is_webgl2 ? gl.HALF_FLOAT : ext.HALF_FLOAT_OES;
         row_alignment = 2;
     }
-    else {
+    else if (array_dtype == 'float32') {
         const ext = gl.getExtension('OES_texture_float');
         const ext_lin = gl.getExtension('OES_texture_float_linear');
 
@@ -47,6 +54,12 @@ function getGLFormatTypeAlignment(gl: WebGLAnyRenderingContext, is_float16: bool
         format = is_webgl2 ? gl.R32F : gl.LUMINANCE;
         type = gl.FLOAT;
         row_alignment = 4;
+    }
+    else {
+        format = is_webgl2 ? gl.R8 : gl.LUMINANCE;
+        type = gl.UNSIGNED_BYTE;
+
+        row_alignment = 1;
     }
 
     return {format: format, type: type, row_alignment: row_alignment};
