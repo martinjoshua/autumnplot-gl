@@ -133,6 +133,8 @@ abstract class Grid {
         return await this.billboard_buffer_cache.getValue(gl, thin_fac, max_zoom);
     }
 
+    public abstract getTransformParams(): GridTransformParams;
+
     public abstract copy(): Grid;
 
     public getVectorRotationAtPoint(lon: number, lat: number) {    
@@ -304,6 +306,11 @@ class PlateCarreeGrid extends StructuredGrid {
     }
 
     /** @internal */
+    public getTransformParams(): GridTransformParams {
+        return { type: 'identity' };
+    }
+
+    /** @internal */
     public copy(opts?: {ni?: number, nj?: number, ll_lon?: number, ll_lat?: number, ur_lon?: number, ur_lat?: number}) {
         opts = opts !== undefined ? opts : {};
         const ni = opts.ni !== undefined ? opts.ni : this.ni;
@@ -434,6 +441,11 @@ class PlateCarreeRotatedGrid extends StructuredGrid {
 
             return {x: x, y: y};
         })
+    }
+
+    /** @internal */
+    public getTransformParams(): GridTransformParams {
+        return { type: 'latlonrot', np_lon: this.np_lon, np_lat: this.np_lat, lon_shift: this.lon_shift };
     }
 
     /** @internal */
@@ -607,6 +619,11 @@ class LambertGrid extends StructuredGrid {
     }
 
     /** @internal */
+    public getTransformParams(): GridTransformParams {
+        return { type: 'lcc', lon_0: this.lon_0, lat_0: this.lat_0, lat_std: this.lat_std, a: this.a, b: this.b };
+    }
+
+    /** @internal */
     public copy(opts?: {ni?: number, nj?: number, ll_x?: number, ll_y?: number, ur_x?: number, ur_y?: number}) {
         opts = opts !== undefined ? opts : {};
         const ni = opts.ni !== undefined ? opts.ni : this.ni;
@@ -719,6 +736,11 @@ class UnstructuredGrid extends Grid {
     }
 
     /** @internal */
+    public getTransformParams(): GridTransformParams {
+        return { type: 'identity' };
+    }
+
+    /** @internal */
     public copy() {
         return new UnstructuredGrid(this.coords);
     }
@@ -777,5 +799,12 @@ class UnstructuredGrid extends Grid {
     }
 }
 
+/** Serializable description of a grid's coordinate transform, for use in web workers */
+type GridTransformParams = 
+    | { type: 'identity' }
+    | { type: 'latlonrot', np_lon: number, np_lat: number, lon_shift: number }
+    | { type: 'lcc', lon_0: number, lat_0: number, lat_std: [number, number], a: number, b: number };
+
 export {Grid, StructuredGrid, PlateCarreeGrid, PlateCarreeRotatedGrid, LambertGrid, UnstructuredGrid};
+export type {GridTransformParams};
 export type {GridType};

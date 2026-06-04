@@ -41,22 +41,18 @@ class RawScalarField<ArrayType extends TypedArray, GridType extends Grid> {
         }
 
         this.contour_cache = new Cache(async (opts: FieldContourOpts) => {
-            // Get grid coordinates and pre-transform them
             const grid_coords = this.grid.getGridCoords();
-            const x_transformed = new Float32Array(grid_coords.x.length);
-            const y_transformed = new Float32Array(grid_coords.y.length);
-            
-            for (let i = 0; i < grid_coords.x.length; i++) {
-                const transformed = this.grid.transform(grid_coords.x[i], grid_coords.y[i], {inverse: true});
-                x_transformed[i] = transformed[0];
-                y_transformed[i] = transformed[1];
-            }
-            
+
+            // Copy the grid coord arrays to new buffers so the originals (which may be cached on the Grid) are not detached by the transfer
+            const x_coords = new Float32Array(grid_coords.x);
+            const y_coords = new Float32Array(grid_coords.y);
+
             const gridData = {
                 ni: this.grid.ni,
                 nj: this.grid.nj,
-                x: x_transformed,
-                y: y_transformed
+                x: x_coords,
+                y: y_coords,
+                transform_params: this.grid.getTransformParams()
             };
             
             // Pass raw buffers and type info for reconstruction on worker side

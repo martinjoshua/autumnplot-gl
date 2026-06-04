@@ -5,7 +5,7 @@ import { contourCreator, FieldContourOpts } from "./ContourCreator";
 import { Grid } from "./Grid";
 
 import * as Comlink from 'comlink';
-import { LngLat } from "./Map";
+import { LngLat, lambertConformalConic, rotateSphere } from "./Map";
 
 function makeBBElements(field_lats: Float32Array, field_lons: Float32Array, min_zoom: Uint8Array, field_ni: number, field_nj: number, map_max_zoom: number) {
         
@@ -391,13 +391,26 @@ const ep_interface = {
             // float16 - stored as Uint16Array
             data = new Uint16Array(dataBuffer);
         }
+
+        // Reconstruct the inverse coordinate transform from the serialized parameters
+        const tp = gridData.transform_params;
+        let inverseTransform: (x: number, y: number) => [number, number];
+        if (tp.type === 'lcc') {
+            const lcc = lambertConformalConic({ lon_0: tp.lon_0, lat_0: tp.lat_0, lat_std: tp.lat_std, a: tp.a, b: tp.b });
+            inverseTransform = (x: number, y: number) => lcc(x, y, { inverse: true });
+        } else if (tp.type === 'latlonrot') {
+            const rot = rotateSphere({ np_lon: tp.np_lon, np_lat: tp.np_lat, lon_shift: tp.lon_shift });
+            inverseTransform = (x: number, y: number) => rot(x, y, { inverse: true });
+        } else {
+            inverseTransform = (x: number, y: number) => [x, y] as [number, number];
+        }
         
-        // Create a minimal grid-like object with pre-transformed coordinates
+        // Create a minimal grid-like object with the raw coords and the reconstructed transform
         const gridLike: any = {
             ni: gridData.ni,
             nj: gridData.nj,
             getGridCoords: () => ({x: gridData.x, y: gridData.y}),
-            transform: (x: number, y: number, opt: any) => [x, y] // identity transform (already transformed)
+            transform: (x: number, y: number, opt?: {inverse?: boolean}) => inverseTransform(x, y)
         };
         
         return await contourCreator(data, gridLike as Grid, opts as FieldContourOpts);
