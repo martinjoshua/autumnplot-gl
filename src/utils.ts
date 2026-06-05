@@ -1,98 +1,4 @@
-
-const hex2rgba = (hexstr: string, out_type?: string) : [number, number, number, number] => {
-    out_type = out_type === undefined ? 'float' : out_type;
-
-    const match = hexstr.match(/#([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})?/i);
-    if (match === null) {
-        throw `Got '${hexstr}' in hex2rgba, which does not look like a hex color`;
-    }
-
-    let rgba = match.slice(1).filter(c => c !== undefined).map(c => parseInt(c, 16));
-
-    if (out_type == 'float') {
-        rgba = rgba.map(c => c / 255);
-    }
-
-    return rgba[3] === undefined ? [rgba[0], rgba[1], rgba[2], 1] : [rgba[0], rgba[1], rgba[2], rgba[3]];
-}
-
-const rgba2hex = (rgba: [number, number, number, number], in_type?: string) : string => {
-    in_type = in_type === undefined ? 'float' : in_type;
-
-    let rgba_ = rgba as number[];
-    if (in_type == 'float') {
-        rgba_ = rgba_.map(c => Math.round(c * 255));
-    }
-
-    return '#' + rgba_.map(c => c.toString(16).padStart(2, '0').toUpperCase()).join('');
-}
-
-const hex2rgb = (hexstr: string, out_type?: string) : [number, number, number] => {
-    const[r, g, b, a] = hex2rgba(hexstr, out_type);
-    return [r, g, b];
-}
-
-const rgb2hex = (rgb: [number, number, number], in_type?: string) : string => {
-    const [r, g, b] = rgb;
-    return rgba2hex([r, g, b, 0], in_type).slice(0, -2);
-}
-
-const rgb2hsv = (rgb: [number, number, number]) : [number, number, number] => {
-    const [r, g, b] = rgb;
-
-    const Cmax = Math.max(r, g, b);
-    const Cmin = Math.min(r, g, b);
-    const Delta = Cmax - Cmin;
-    
-    let H: number;
-    if (Delta == 0) {
-        H = 0;
-    }
-    else if (Cmax == r) {
-        H = 60 * ((g - b) / Delta) % 6;
-    }
-    else if (Cmax == g) {
-        H = 60 * ((b - r) / Delta + 2);
-    }
-    else if (Cmax == b) {
-        H = 60 * ((r - g) / Delta + 4);
-    }
-
-    let S = Cmax == 0 ? 0 : Delta / Cmax;
-    let V = Cmax;
-
-    return [H, S, V];
-}
-
-const hsv2rgb = (hsv: [number, number, number]) : [number, number, number] => {
-    const [H, S, V] = hsv;
-
-    const C = V * S;
-    const X = C * (1 - Math.abs(H / 60 % 2 - 1));
-    const m = V - C;
-
-    let r_prime, g_prime, b_prime;
-    if (0 <= H && H < 60) {
-        r_prime = C; g_prime = X, b_prime = 0;
-    }
-    else if (60 <= H && H < 120) {
-        r_prime = X; g_prime = C, b_prime = 0;
-    }
-    else if (120 <= H && H < 180) {
-        r_prime = 0; g_prime = C, b_prime = X;
-    }
-    else if (180 <= H && H < 240) {
-        r_prime = 0; g_prime = X, b_prime = C;
-    }
-    else if (240 <= H && H < 300) {
-        r_prime = X; g_prime = 0, b_prime = C;
-    }
-    else if (300 <= H && H < 360) {
-        r_prime = C; g_prime = 0, b_prime = X;
-    }
-
-    return [r_prime + m, g_prime + m, b_prime + m];
-}
+import { TypedArray, TypedArrayStr } from "./AutumnTypes";
 
 function getMinZoom(jlat: number, ilon: number, thin_fac_base: number) {
     const zoom_base = 1;
@@ -181,4 +87,95 @@ function normalizeOptions<Type extends Record<string, any>>(opts: Type | undefin
     return ret;
 }
 
-export {hex2rgba, rgba2hex, hex2rgb, rgb2hex, rgb2hsv, hsv2rgb, zip, getMinZoom, getOS, Cache, normalizeOptions};
+function getArrayConstructor<ArrayType extends TypedArray>(ary: ArrayType) : new(...args: any[]) => ArrayType {
+    return ary.constructor as new(...args: any[]) => ArrayType;
+}
+
+function mergeShaderCode(snippet: string, main: string) {
+    const ES3_SHADER_MAGIC = '#version 300 es\n';
+    const is_es3_shader = main.startsWith(ES3_SHADER_MAGIC);
+
+    if (is_es3_shader) {
+        return ES3_SHADER_MAGIC + snippet + "\n" + main.slice(ES3_SHADER_MAGIC.length);
+    }
+    
+    return snippet + "\n" + main;
+}
+
+function applySamplerCodeScalar(src: string, sampler_names: string[], sampler_expression: string, dtypes: TypedArrayStr[]) {
+    // TAS: find a better place for this to live.
+    const SAMPLER_DTYPES = {
+        'float16': 'sampler2D', 'float32': 'sampler2D', 
+        'uint8': 'lowp usampler2D', 'uint16': 'mediump usampler2D', 'uint32': 'highp usampler2D',
+        'int16': 'mediump isampler2D', 'int32': 'highp isampler2D',
+    };
+
+    const SHADER_DTYPES = {
+        'float16': 'highp float', 'float32': 'highp float',
+        'uint8': 'uint', 'uint16': 'uint', 'uint32': 'uint',
+        'int16': 'int', 'int32': 'int',
+    }
+
+    const samplers = sampler_names.map((v, i) => `uniform ${SAMPLER_DTYPES[dtypes[i]]} ${v};`).join("\n");
+    const sampler_get = sampler_names.map((v, i) => `    ${SHADER_DTYPES[dtypes[i]]} ${v}_val = texture(${v}, tex_coord).r;`).join("\n");
+
+    sampler_names.forEach(v => sampler_expression = sampler_expression.replaceAll(v, `${v}_val`));
+
+    // TAS: This assumes that the return type of the expression is the same as the type of the inputs. May need to revisit this later.
+    const sampler_code = `
+${samplers}
+
+${SHADER_DTYPES[dtypes[0]]} get_field_value(lowp vec2 tex_coord) {
+${sampler_get}
+    return ${sampler_expression};
+}`;
+
+    return mergeShaderCode(sampler_code, src);
+}
+
+function applySamplerCodeVector(src: string, sampler_names: {u: string[], v: string[]}, sampler_expressions: {u: string, v: string}) {
+    const samplers = sampler_names.u.map(v => `uniform sampler2D ${v};`).join("\n") + "\n" +
+                     sampler_names.v.map(v => `uniform sampler2D ${v};`).join("\n");
+    const sampler_u_get = sampler_names.u.map(v => `    highp float ${v}_val = texture(${v}, tex_coord).r;`).join("\n");
+    const sampler_v_get = sampler_names.v.map(v => `    highp float ${v}_val = texture(${v}, tex_coord).r;`).join("\n");
+
+    let sampler_expression_u = sampler_expressions.u;
+    sampler_names.u.forEach(v => sampler_expression_u = sampler_expression_u.replaceAll(v, `${v}_val`));
+    let sampler_expression_v = sampler_expressions.v;
+    sampler_names.v.forEach(v => sampler_expression_v = sampler_expression_v.replaceAll(v, `${v}_val`));
+
+    const sampler_code = `
+${samplers}
+
+highp float get_field_value_u(lowp vec2 tex_coord) {
+${sampler_u_get}
+    return ${sampler_expression_u};
+}
+
+highp float get_field_value_v(lowp vec2 tex_coord) {
+${sampler_v_get}
+    return ${sampler_expression_v};
+}`;
+
+    return mergeShaderCode(sampler_code, src);
+}
+
+function argMin<T>(ary: T[] | TypedArray) {
+    if (ary.length === 0) {
+        return -1;
+    }
+
+    let min = ary[0];
+    let minIndex = 0;
+
+    for (let i = 1; i < ary.length; i++) {
+        if (ary[i] < min) {
+            minIndex = i;
+            min = ary[i];
+        }
+    }
+
+    return minIndex;
+}
+
+export {zip, getMinZoom, getOS, Cache, normalizeOptions, getArrayConstructor, mergeShaderCode, applySamplerCodeScalar, applySamplerCodeVector, argMin};
